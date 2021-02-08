@@ -16,6 +16,7 @@ from CTFd.models import Awards, Submissions, Teams, Unlocks, Users, db
 from CTFd.schemas.awards import AwardSchema
 from CTFd.schemas.submissions import SubmissionSchema
 from CTFd.schemas.teams import TeamSchema
+from CTFd.utils import get_config
 from CTFd.utils.decorators import admins_only, authed_only, require_team
 from CTFd.utils.decorators.visibility import (
     check_account_visibility,
@@ -306,6 +307,92 @@ class TeamPrivate(Resource):
 
         return {"success": True, "data": response.data}
 
+    @authed_only
+    @require_team
+    @teams_namespace.doc(
+        description="Endpoint to disband your current team. Can only be used if the team has performed no actions in the CTF.",
+        responses={200: ("Success", "APISimpleSuccessResponse")},
+    )
+    def delete(self):
+        team_disbanding = get_config("team_disbanding", default="inactive_only")
+        if team_disbanding == "disabled":
+            return (
+                {
+                    "success": False,
+                    "errors": {"": ["Team disbanding is currently disabled"]},
+                },
+                403,
+            )
+
+        team = get_current_team()
+        if team.captain_id != session["id"]:
+            return (
+                {
+                    "success": False,
+                    "errors": {"": ["Only team captains can disband their team"]},
+                },
+                403,
+            )
+
+        # The team must not have performed any actions in the CTF
+        performed_actions = any(
+            [
+                team.solves != [],
+                team.fails != [],
+                team.awards != [],
+                Submissions.query.filter_by(team_id=team.id).all() != [],
+                Unlocks.query.filter_by(team_id=team.id).all() != [],
+            ]
+        )
+
+        if performed_actions:
+            return (
+                {
+                    "success": False,
+                    "errors": {
+                        "": [
+                            "You cannot disband your team as it has participated in the event. "
+                            "Please contact an admin to disband your team or remove a member."
+                        ]
+                    },
+                },
+                403,
+            )
+
+        for member in team.members:
+            member.team_id = None
+            clear_user_session(user_id=member.id)
+
+        db.session.delete(team)
+        db.session.commit()
+
+        clear_team_session(team_id=team.id)
+        clear_standings()
+
+        db.session.close()
+
+        return {"success": True}
+
+
+@teams_namespace.route("/me/members")
+class TeamPrivateMembers(Resource):
+    @authed_only
+    @require_team
+    def post(self):
+        team = get_current_team()
+        if team.captain_id != session["id"]:
+            return (
+                {
+                    "success": False,
+                    "errors": {"": ["Only team captains can generate invite codes"]},
+                },
+                403,
+            )
+
+        invite_code = team.get_invite_code()
+        response = {"code": invite_code}
+        return {"success": True, "data": response}
+
 
 @teams_namespace.route("/<team_id>/members")
 @teams_namespace.param("team_id", "Team ID")
@@ -329,8 +416,14 @@ class TeamMembers(Resource):
     def post(self, team_id):
         team = Teams.query.filter_by(id=team_id).first_or_404()
 
+        # Generate an invite code if no user or body is specified
+        if len(request.data) == 0:
+            invite_code = team.get_invite_code()
+            response = {"code": invite_code}
+            return {"success": True, "data": response}
+
         data = request.get_json()
-        user_id = data["user_id"]
+        user_id = data.get("user_id")
         user = Users.query.filter_by(id=user_id).first_or_404()
         if user.team_id is None:
             team.members.append(user)
